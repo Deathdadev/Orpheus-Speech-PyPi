@@ -22,6 +22,10 @@ This package supports both Windows and non-Windows platforms:
 
 The appropriate backend is automatically selected based on your operating system.
 
+## Plan
+- [x] Semi-Implement for Windows
+- [ ] Create a VLLM whl for Windows to improve speed: *via* https://github.com/vllm-project/vllm/pull/14891
+
 ## Usage
 
 ```python
