@@ -2,7 +2,7 @@
 
 This package provides a Python interface to the Orpheus Text-to-Speech models.
 
-# This may or may not work
+## This is a temporary workaround and may not be perfect
 
 ## Installation
 
