@@ -1,11 +1,16 @@
 from setuptools import setup, find_packages
+import platform
 
+# Define platform-specific dependencies
+install_requires = ["snac", "transformers"]
+if platform.system() != "Windows":
+    install_requires.append("vllm")
 
 setup(
     name="orpheus-speech",
     version="0.1.0",
     packages=find_packages(),
-    install_requires=["snac", "vllm"],
+    install_requires=install_requires,
     author="Amu Varma",
     author_email="amu@canopylabs.com",
     description="Orpheus Text-to-Speech System",
