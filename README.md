@@ -9,6 +9,8 @@ This package provides a Python interface to the Orpheus Text-to-Speech models.
 ```bash
 pip install git+https://github.com/Deathdadev/Orpheus-Speech-PyPi --extra-index-url https://download.pytorch.org/whl/cu124
 pip install accelerate
+
+## Remove or change --extra-index-url https://download.pytorch.org/whl/cu124 to install according to your system. 
 ```
 
 ## Platform Support
