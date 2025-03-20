@@ -1,10 +1,14 @@
 import asyncio
 import torch
-from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
-from transformers import AutoTokenizer
-import threadingc
+import platform
+import threading
 import queue
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from .decoder import tokens_decoder_sync
+
+# Only import vllm if not on Windows
+if platform.system() != "Windows":
+    from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 
 class OrpheusModel:
     def __init__(self, model_name, dtype=torch.bfloat16):
@@ -38,16 +42,9 @@ class OrpheusModel:
         else:
             return model_name
         
-    def _setup_engine(self):
-        engine_args = AsyncEngineArgs(
-            model=self.model_name,
-            dtype=self.dtype,
-        )
-        return AsyncLLMEngine.from_engine_args(engine_args)
-    
     def validate_voice(self, voice):
         if voice:
-            if voice not in self.engine.available_voices:
+            if voice not in self.available_voices:
                 raise ValueError(f"Voice {voice} is not available for model {self.model_name}")
     
     def _format_prompt(self, prompt, voice="tara", model_type="larger"):
@@ -76,15 +73,131 @@ class OrpheusModel:
  
 
 
-    def generate_tokens_sync(self, prompt, voice=None, request_id="req-001", temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids = [49158], repetition_penalty=1.3):
+    def generate_tokens_sync(self, prompt, voice=None, request_id="req-001", temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
         prompt_string = self._format_prompt(prompt, voice)
         print(prompt)
+        
+        # Use different generation methods based on platform
+        if self.platform == "Windows":
+            return self._generate_tokens_transformers(
+                prompt_string, 
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stop_token_ids=stop_token_ids,
+                repetition_penalty=repetition_penalty
+            )
+        else:
+            return self._generate_tokens_vllm(
+                prompt_string, 
+                request_id=request_id,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stop_token_ids=stop_token_ids,
+                repetition_penalty=repetition_penalty
+            )
+    
+    def _generate_tokens_transformers(self, prompt_string, temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
+        """Generate tokens using transformers for Windows compatibility"""
+        token_queue = queue.Queue()
+        
+        def generate_tokens():
+            # Encode the prompt
+            inputs = self.tokeniser(prompt_string, return_tensors="pt").to(self.model.device)
+            input_length = inputs.input_ids.shape[1]
+            
+            # Setup generation parameters
+            gen_config = {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "repetition_penalty": repetition_penalty,
+                "do_sample": True,
+                "eos_token_id": stop_token_ids,
+            }
+            
+            # Generate tokens one by one
+            generated = inputs.input_ids
+            past_key_values = None
+            
+            for _ in range(max_tokens):
+                with torch.no_grad():
+                    if past_key_values is None:
+                        outputs = self.model(**inputs, return_dict=True, use_cache=True)
+                    else:
+                        outputs = self.model(
+                            input_ids=generated[:, -1:],
+                            past_key_values=past_key_values,
+                            return_dict=True,
+                            use_cache=True
+                        )
+                
+                past_key_values = outputs.past_key_values
+                next_token_logits = outputs.logits[:, -1, :]
+                
+                # Apply temperature
+                next_token_logits = next_token_logits / temperature
+                
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for seq_idx in range(generated.shape[0]):
+                        for token_idx in set(generated[seq_idx].tolist()):
+                            next_token_logits[seq_idx, token_idx] /= repetition_penalty
+                
+                # Apply top-p sampling
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift the indices to the right to keep also the first token above the threshold
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    for batch_idx in range(next_token_logits.shape[0]):
+                        indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
+                        next_token_logits[batch_idx, indices_to_remove] = -float('Inf')
+                
+                # Sample next token
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                # Check if we've reached a stop token
+                if next_token.item() in stop_token_ids:
+                    break
+                
+                # Add the token to the generated sequence
+                generated = torch.cat((generated, next_token), dim=1)
+                
+                # Decode the new token and put it in the queue
+                new_token = self.tokeniser.decode(next_token[0], skip_special_tokens=False)
+                token_queue.put(new_token)
+                
+            token_queue.put(None)  # Signal completion
+        
+        # Start generation in a separate thread
+        thread = threading.Thread(target=generate_tokens)
+        thread.start()
+        
+        # Yield tokens as they become available
+        while True:
+            token = token_queue.get()
+            if token is None:
+                break
+            yield token
+        
+        thread.join()
+    
+    def _generate_tokens_vllm(self, prompt_string, request_id="req-001", temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
+        """Generate tokens using vllm for non-Windows platforms"""
         sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,  # Adjust max_tokens as needed.
-        stop_token_ids = stop_token_ids, 
-        repetition_penalty=repetition_penalty, 
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stop_token_ids=stop_token_ids,
+            repetition_penalty=repetition_penalty,
         )
 
         token_queue = queue.Queue()
@@ -111,5 +224,3 @@ class OrpheusModel:
     
     def generate_speech(self, **kwargs):
         return tokens_decoder_sync(self.generate_tokens_sync(**kwargs))
-
-
