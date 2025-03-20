@@ -14,6 +14,7 @@ class OrpheusModel:
     def __init__(self, model_name, dtype=torch.bfloat16):
         self.model_name = self._map_model_params(model_name)
         self.dtype = dtype
+        self.platform = platform.system()  # Set the platform attribute
         self.engine = self._setup_engine()
         self.available_voices = ["zoe", "zac","jess", "leo", "mia", "julia", "leah"]
         self.tokeniser = AutoTokenizer.from_pretrained(model_name)
@@ -38,7 +39,7 @@ class OrpheusModel:
         if (model_name  in unsupported_models):
             raise ValueError(f"Model {model_name} is not supported. Only medium-3b is supported, small, micro and nano models will be released very soon")
         elif model_name in model_map:
-            return model_name[model_name]["repo_id"]
+            return model_map[model_name]["repo_id"]
         else:
             return model_name
         
@@ -70,7 +71,26 @@ class OrpheusModel:
                 prompt_string = self.tokeniser.decode(all_input_ids[0])
                 return prompt_string
 
- 
+    def _setup_engine(self):
+        """Set up the appropriate engine based on the platform."""
+        if self.platform == "Windows":
+            # For Windows, use transformers directly
+            print(f"Setting up transformers engine for {self.model_name}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=self.dtype,
+                device_map="auto"
+            )
+            return None  # No separate engine needed for transformers
+        else:
+            # For non-Windows, use vllm
+            print(f"Setting up vllm engine for {self.model_name}")
+            engine_args = AsyncEngineArgs(
+                model=self.model_name,
+                dtype=str(self.dtype).split('.')[-1],
+                gpu_memory_utilization=0.8,
+            )
+            return AsyncLLMEngine.from_engine_args(engine_args)
 
 
     def generate_tokens_sync(self, prompt, voice=None, request_id="req-001", temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
@@ -100,6 +120,9 @@ class OrpheusModel:
     
     def _generate_tokens_transformers(self, prompt_string, temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
         """Generate tokens using transformers for Windows compatibility"""
+        if not hasattr(self, 'model') or self.model is None:
+            raise RuntimeError("Transformers model is not available. Make sure you're running on Windows or initialize the model manually.")
+            
         token_queue = queue.Queue()
         
         def generate_tokens():
@@ -192,6 +215,9 @@ class OrpheusModel:
     
     def _generate_tokens_vllm(self, prompt_string, request_id="req-001", temperature=0.6, top_p=0.8, max_tokens=1200, stop_token_ids=[49158], repetition_penalty=1.3):
         """Generate tokens using vllm for non-Windows platforms"""
+        if self.engine is None:
+            raise RuntimeError("vllm engine is not available on this platform. Use _generate_tokens_transformers instead.")
+            
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
