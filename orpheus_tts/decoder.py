@@ -127,11 +127,12 @@ def convert_to_audio(multiframe, count):
         # Prepare codes for model input
         codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
 
-        # Validate code values
+        # Validate code values and clamp them to valid range if needed
         for i, code in enumerate(codes):
             if torch.any(code < 0) or torch.any(code > CODES_MAX_VALUE):
                 logger.warning(f"Invalid code values detected in codebook {i}: values must be between 0 and {CODES_MAX_VALUE}")
-                return None
+                # Clamp values to valid range instead of returning None
+                codes[i] = torch.clamp(code, 0, CODES_MAX_VALUE)
 
         # Decode audio using the SNAC model
         audio_hat = snac_model.decode(codes)
@@ -218,12 +219,18 @@ async def tokens_decoder(token_gen, max_buffer_size=1000):
                 # Limit buffer size to prevent memory issues
                 if len(buffer) > max_buffer_size:
                     logger.warning(f"Buffer exceeded max size ({max_buffer_size}). Trimming to prevent memory issues.")
-                    buffer = buffer[-max_buffer_size:]
+                    # Keep a multiple of FRAME_SIZE tokens to maintain frame alignment
+                    keep_tokens = (max_buffer_size // FRAME_SIZE) * FRAME_SIZE
+                    buffer = buffer[-keep_tokens:]
 
                 # Process buffer when we have enough tokens and at frame boundaries
                 if count % FRAME_SIZE == 0 and count > MIN_BUFFER_SIZE - 1:
-                    # Use only the most recent tokens needed for processing
-                    buffer_to_proc = buffer[-MIN_BUFFER_SIZE:]
+                    # Calculate how many complete frames we can process
+                    num_frames = len(buffer) // FRAME_SIZE
+                    # Use at least MIN_BUFFER_SIZE tokens, but always in complete frames
+                    tokens_to_use = max(MIN_BUFFER_SIZE, num_frames * FRAME_SIZE)
+                    # Use the most recent complete frames
+                    buffer_to_proc = buffer[-tokens_to_use:]
 
                     # Convert tokens to audio
                     audio_samples = convert_to_audio(buffer_to_proc, count)
