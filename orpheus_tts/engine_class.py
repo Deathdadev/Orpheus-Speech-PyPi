@@ -26,7 +26,7 @@ class OrpheusModel:
         self.dtype = dtype
         self.platform = platform.system()  # Set the platform attribute
         self.engine = self._setup_engine()
-        self.available_voices = ["zoe", "zac","jess", "leo", "mia", "julia", "leah"]
+        self.available_voices = ["tara", "jess", "leo", "leah", "dan", "mia", "zac", "zoe"]
         self.tokeniser = AutoTokenizer.from_pretrained(model_name)
 
 
