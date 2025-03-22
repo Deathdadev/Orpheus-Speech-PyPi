@@ -6,6 +6,7 @@ import threading
 import queue
 import logging
 import os
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -92,11 +93,20 @@ def convert_to_audio(multiframe, count):
 
         # Calculate number of complete frames
         num_frames = len(multiframe) // FRAME_SIZE
+        if num_frames == 0:
+            logger.warning("No complete frames available for processing")
+            return None
+            
         frame = multiframe[:num_frames*FRAME_SIZE]
 
         # Process each frame
         for j in range(num_frames):
             i = FRAME_SIZE * j
+            
+            # Ensure we don't go out of bounds
+            if i + FRAME_SIZE > len(frame):
+                logger.warning(f"Frame index {i} would exceed frame length {len(frame)}")
+                break
 
             # Process codes for the first codebook
             if codes_0.shape[0] == 0:
@@ -133,18 +143,52 @@ def convert_to_audio(multiframe, count):
                 logger.warning(f"Invalid code values detected in codebook {i}: values must be between 0 and {CODES_MAX_VALUE}")
                 # Clamp values to valid range instead of returning None
                 codes[i] = torch.clamp(code, 0, CODES_MAX_VALUE)
+                
+        # Validate code shapes for SNAC model
+        expected_shapes = [
+            (1, codes_0.shape[0]),
+            (1, codes_1.shape[0]),
+            (1, codes_2.shape[0])
+        ]
+        
+        for i, (code, expected_shape) in enumerate(zip(codes, expected_shapes)):
+            if code.shape != expected_shape:
+                logger.warning(f"Invalid code shape for codebook {i}: expected {expected_shape}, got {code.shape}")
+                # Try to reshape if possible, otherwise return None
+                if code.numel() == expected_shape[0] * expected_shape[1]:
+                    codes[i] = code.reshape(expected_shape)
+                else:
+                    logger.error(f"Cannot reshape code {i} to expected shape {expected_shape}")
+                    return None
 
-        # Decode audio using the SNAC model
-        audio_hat = snac_model.decode(codes)
+        # Decode audio using the SNAC model with error handling
+        try:
+            audio_hat = snac_model.decode(codes)
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "index" in str(e).lower() or "out of bounds" in str(e).lower():
+                logger.error(f"CUDA error during audio decoding: {str(e)}")
+                # Return empty audio instead of failing
+                return b''
+            else:
+                # Re-raise other errors
+                raise
 
-        # Process the audio output
-        audio_slice = audio_hat[:, :, 2048:4096]  # Extract the relevant portion of audio
-        detached_audio = audio_slice.detach().cpu()
-        audio_np = detached_audio.numpy()
-        audio_int16 = (audio_np * 32767).astype(np.int16)  # Convert to 16-bit PCM
-        audio_bytes = audio_int16.tobytes()
-
-        return audio_bytes
+        # Process the audio output safely
+        if audio_hat is None or audio_hat.shape[2] < 4096:
+            logger.warning("Audio output is None or too small")
+            return b''
+            
+        # Extract the relevant portion of audio safely
+        try:
+            audio_slice = audio_hat[:, :, 2048:4096]  # Extract the relevant portion of audio
+            detached_audio = audio_slice.detach().cpu()
+            audio_np = detached_audio.numpy()
+            audio_int16 = (audio_np * 32767).astype(np.int16)  # Convert to 16-bit PCM
+            audio_bytes = audio_int16.tobytes()
+            return audio_bytes
+        except Exception as e:
+            logger.error(f"Error processing audio output: {str(e)}")
+            return b''
 
     except Exception as e:
         logger.error(f"Error converting tokens to audio: {str(e)}")
@@ -205,13 +249,15 @@ async def tokens_decoder(token_gen, max_buffer_size=1000):
     """
     buffer = []
     count = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 3  # Maximum number of consecutive errors before yielding silence
 
     try:
         async for token_sim in token_gen:
             # Convert token string to ID
             token = turn_token_into_id(token_sim, count)
 
-            if token is not None and token > 0:
+            if token is not None and token >= 0:  # Changed from > 0 to >= 0 to include 0 as valid
                 # Add valid token to buffer
                 buffer.append(token)
                 count += 1
@@ -229,16 +275,35 @@ async def tokens_decoder(token_gen, max_buffer_size=1000):
                     num_frames = len(buffer) // FRAME_SIZE
                     # Use at least MIN_BUFFER_SIZE tokens, but always in complete frames
                     tokens_to_use = max(MIN_BUFFER_SIZE, num_frames * FRAME_SIZE)
+                    # Ensure tokens_to_use is a multiple of FRAME_SIZE
+                    tokens_to_use = (tokens_to_use // FRAME_SIZE) * FRAME_SIZE
                     # Use the most recent complete frames
                     buffer_to_proc = buffer[-tokens_to_use:]
 
                     # Convert tokens to audio
                     audio_samples = convert_to_audio(buffer_to_proc, count)
 
-                    if audio_samples is not None:
+                    if audio_samples is not None and len(audio_samples) > 0:
+                        consecutive_errors = 0  # Reset error counter on success
                         yield audio_samples
+                    else:
+                        consecutive_errors += 1
+                        logger.warning(f"Failed to generate audio (attempt {consecutive_errors}/{max_consecutive_errors})")
+                        
+                        if consecutive_errors >= max_consecutive_errors:
+                            # Generate silence as a fallback after multiple failures
+                            logger.warning("Generating silence as fallback after multiple failures")
+                            # Generate 0.1 seconds of silence at 24kHz (16-bit)
+                            silence_samples = b'\x00\x00' * 2400
+                            yield silence_samples
+                            consecutive_errors = 0  # Reset after yielding silence
+            elif token is not None:
+                logger.warning(f"Invalid token value: {token} (must be >= 0)")
     except Exception as e:
         logger.error(f"Error in tokens_decoder: {str(e)}")
+        # Yield silence as a fallback when an exception occurs
+        silence_samples = b'\x00\x00' * 2400
+        yield silence_samples
         # Re-raise to propagate the error
         raise
 
@@ -264,6 +329,7 @@ def tokens_decoder_sync(syn_token_gen, max_buffer_size=1000, timeout=60):
     # Create a thread-safe queue for passing audio chunks between threads
     audio_queue = queue.Queue()
     error_queue = queue.Queue()  # For passing exceptions from the thread
+    stall_timeout = timeout // 2  # Timeout for detecting stalled generation
 
     # Convert the synchronous token generator into an async generator
     async def async_token_gen():
@@ -278,10 +344,16 @@ def tokens_decoder_sync(syn_token_gen, max_buffer_size=1000, timeout=60):
         try:
             # Process tokens through the async decoder
             async for audio_chunk in tokens_decoder(async_token_gen(), max_buffer_size=max_buffer_size):
-                audio_queue.put(audio_chunk)
+                if audio_chunk is not None and len(audio_chunk) > 0:
+                    audio_queue.put(audio_chunk)
+                else:
+                    # If we get empty audio, put a small silence chunk
+                    audio_queue.put(b'\x00\x00' * 1200)  # 0.05 seconds of silence
         except Exception as e:
             # Put the exception in the error queue to propagate it to the main thread
             error_queue.put(e)
+            # Put a silence chunk to prevent blocking
+            audio_queue.put(b'\x00\x00' * 2400)  # 0.1 seconds of silence
         finally:
             # Always signal completion
             audio_queue.put(None)  # Sentinel
@@ -292,7 +364,9 @@ def tokens_decoder_sync(syn_token_gen, max_buffer_size=1000, timeout=60):
         except Exception as e:
             # Catch any exceptions not caught in async_producer
             error_queue.put(e)
-            audio_queue.put(None)  # Ensure the main thread doesn't hang
+            # Ensure the main thread doesn't hang
+            audio_queue.put(b'\x00\x00' * 2400)  # 0.1 seconds of silence
+            audio_queue.put(None)  # Sentinel
 
     # Start the async processing in a separate thread
     thread = threading.Thread(target=run_async)
@@ -301,21 +375,51 @@ def tokens_decoder_sync(syn_token_gen, max_buffer_size=1000, timeout=60):
 
     try:
         # Yield audio chunks as they become available
+        last_audio_time = time.time()
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 3
+        
         while True:
             # Check for errors from the async thread
             if not error_queue.empty():
                 exception = error_queue.get()
-                raise RuntimeError(f"Error in async processing thread: {str(exception)}") from exception
+                logger.error(f"Error in async processing thread: {str(exception)}")
+                # Continue with silence instead of raising the exception
+                yield b'\x00\x00' * 4800  # 0.2 seconds of silence
+                consecutive_timeouts = 0
+                last_audio_time = time.time()
+                continue
 
             # Get the next audio chunk with timeout
             try:
                 audio = audio_queue.get(timeout=timeout)
                 if audio is None:
+                    # End of generation
                     break
+                    
+                # Reset counters on successful audio retrieval
+                consecutive_timeouts = 0
+                last_audio_time = time.time()
+                
+                # Yield the audio chunk
                 yield audio
+                
             except queue.Empty:
-                logger.warning(f"Timeout ({timeout}s) waiting for audio chunks")
-                break
+                consecutive_timeouts += 1
+                current_time = time.time()
+                stall_duration = current_time - last_audio_time
+                
+                logger.warning(f"Timeout ({timeout}s) waiting for audio chunks (attempt {consecutive_timeouts}/{max_consecutive_timeouts})")
+                
+                if stall_duration > stall_timeout:
+                    logger.warning(f"Audio generation stalled for {stall_duration:.1f}s, yielding silence")
+                    # Yield silence to maintain audio flow
+                    yield b'\x00\x00' * 4800  # 0.2 seconds of silence
+                    last_audio_time = current_time
+                
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    logger.error("Too many consecutive timeouts, ending generation")
+                    break
     finally:
         # Clean up resources
         if thread.is_alive():
